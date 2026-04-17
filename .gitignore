@@ -1,0 +1,19 @@
+# Ignore environment variables
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+
+
+# VS Code settings
+.vscode/
+
+# uv internal files (Optional - most people keep uv.lock but ignore the tool cache)
+.uv/
+
+# ChromaDB data directory (if you want to ignore it)
+chroma_db/

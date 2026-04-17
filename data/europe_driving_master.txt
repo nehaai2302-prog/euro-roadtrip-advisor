@@ -1,0 +1,26 @@
+# MASTER KNOWLEDGE BASE: EUROPEAN ROAD LOGISTICS 2026
+
+## REGION: WESTERN EUROPE (France, Belgium, Netherlands)
+- TOLLS: France uses 'Péage' booths (barrier system). Use 'Télépéage' lanes for tags like Liber-t.
+- ZONES: Paris and Lyon require 'Crit'Air' stickers. Fines for missing stickers start at €68.
+- EQUIPMENT: 1 reflective vest per occupant (stored in cabin) and 1 warning triangle are mandatory.
+
+## REGION: ALPINE COUNTRIES (Switzerland, Austria)
+- HIGHWAYS: Switzerland requires a physical or e-vignette (40 CHF). Austria requires a 1-day, 10-day, or annual vignette.
+- WINTER: From Nov 1 to April 15, winter tires are mandatory. Snow chains must be in the trunk if driving in mountain passes.
+- LIGHTS: Daytime running lights are mandatory year-round in Switzerland.
+
+## REGION: CENTRAL EUROPE (Germany, Poland, Czech Republic)
+- AUTOBAHN: Germany is free for cars, but Poland and Czech Republic use vignettes or electronic tolling (e-TOLL).
+- EQUIPMENT: Germany requires a First Aid kit (DIN 13164 standard) and a warning triangle.
+- ZONES: German cities require 'Umweltzone' (Green Stickers).
+
+## REGION: MEDITERRANEAN (Italy, Spain, Portugal)
+- ITALY: Avoid ZTL (Zona Traffico Limitato) centers; they are for locals only and cameras will fine you automatically.
+- SPAIN: V16 beacons (emergency flashing lights) have replaced warning triangles as of Jan 2026.
+- PARKING: Blue lines mean paid parking; white lines are free; yellow is restricted.
+
+## GENERAL CROSS-BORDER RULES
+- LICENSE: A standard EU/UK license is valid. US/Australian drivers should carry an International Driving Permit (IDP).
+- BLOOD ALCOHOL: The standard limit is 0.05% (0.02% in Norway/Poland). Zero tolerance for novice drivers.
+- PHONES: Using a handheld phone is illegal everywhere. Fines in the Netherlands can reach €400+.
