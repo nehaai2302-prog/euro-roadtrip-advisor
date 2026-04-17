@@ -1,3 +1,13 @@
+import sys
+try:
+    # This will fail on your Windows machine (ImportError), which is fine!
+    # It will succeed on Streamlit Linux.
+    __import__('pysqlite3')
+    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+except ImportError:
+    # On Windows, we just use the built-in sqlite3
+    pass
+
 import os
 import json
 from pathlib import Path
@@ -9,7 +19,6 @@ from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langsmith import traceable
-
 
 
 # --- 1. SETUP VECTOR STORE ---

@@ -1,4 +1,5 @@
 import os
+import streamlit as st
 from dotenv import load_dotenv 
 from pathlib import Path
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
@@ -20,8 +21,9 @@ print(f"📂 Data will be loaded from: {DATA_PATH}")
 print(f"🗄️ Database will be created at: {CHROMA_PATH}")
 
 def run_ingestion():
+        
     # Load your OpenAI Key (Ensure it's in your environment variables)
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
     if not api_key:
         print("❌ Error: OPENAI_API_KEY not found in environment.")
         return

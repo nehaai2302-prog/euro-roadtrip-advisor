@@ -14,6 +14,11 @@ from reportlab.lib.styles import getSampleStyleSheet
 from rag_pipeline_fast import estimate_cost
 from safety import check_safety # The new professional safety layer
 
+# NOTE: Run python ingest.py first to build the vector database (./vectordb).
+# After ingestion, you can launch the app with: streamlit run app.py
+# The app uses the persisted DB and does not rebuild it.
+
+
 # Load from .env locally
 load_dotenv()
 

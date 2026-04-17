@@ -107,7 +107,7 @@ project2/
 └── README.md                 # This file
 ```
 ## Mermaid Diagram (System Architecture)
-
+```mermaid
 flowchart TD
 
     A[User] --> B[Streamlit UI - app.py]
@@ -159,12 +159,12 @@ flowchart TD
     D --> Q
     M --> Q
     N --> Q
-
+```
   
 
 ## RAG Pipeline
 
-
+```mermaid
 flowchart LR
 
     A[User Query] --> B[Embedding Model]
@@ -178,10 +178,11 @@ flowchart LR
     E --> F[LLM]
 
     F --> G[Final Answer]
-
+```
 
 ## Intent Routing Logic
 
+```mermaid
 flowchart TD
 
     A[User Query] --> B[Intent Classifier]
@@ -199,6 +200,7 @@ flowchart TD
     F --> I
     G --> I
     H --> I
+```
 
 ## Key Components
 

@@ -15,5 +15,7 @@ venv/
 # uv internal files (Optional - most people keep uv.lock but ignore the tool cache)
 .uv/
 
-# ChromaDB data directory (if you want to ignore it)
-chroma_db/
+
+# Streamlit secrets file (keep it out of version control)
+.streamlit/
+.streamlit/secrets.toml

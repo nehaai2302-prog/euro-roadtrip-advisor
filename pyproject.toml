@@ -12,4 +12,10 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "requests>=2.33.1",
     "streamlit>=1.56.0",
+    # ... other dependencies ...
+    "pysqlite3-binary; sys_platform == 'linux'",
+    "reportlab>=4.4.10",
+    "protobuf<=3.20.3",
+    "langchain-community>=0.4.1",
+    "langchain-text-splitters>=1.1.2",
 ]
