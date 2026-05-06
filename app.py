@@ -1,18 +1,20 @@
 import os
 from dotenv import load_dotenv
 import streamlit as st
-from openai import OpenAI
-from pathlib import Path
 import json
 import pandas as pd
 from datetime import datetime
 from io import BytesIO
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
+from streamlit_folium import st_folium
 
 # Import your custom modules
 from rag_pipeline_fast import estimate_cost
-from safety import check_safety # The new professional safety layer
+from safety import check_safety
+from auth import get_authenticator
+from db import init_db, load_history, save_message, load_preferences, save_preferences
+from map_utils import render_route_map
 
 # NOTE: Run python ingest.py first to build the vector database (./vectordb).
 # After ingestion, you can launch the app with: streamlit run app.py
@@ -34,12 +36,27 @@ os.environ["OPENAI_API_KEY"] = api_key
 
 
 # 1. INITIAL SETUP
-st.set_page_config(page_title="EuroRoad Chatbot", page_icon="🚗", layout="wide")
+st.set_page_config(page_title="Euro Road Trip Advisor", page_icon="🚗", layout="wide")
+init_db()
+
+authenticator = get_authenticator()
+name, authentication_status, username = authenticator.login("main")
+
+if authentication_status is False:
+    st.error("Invalid username or password.")
+    st.stop()
+if authentication_status is None:
+    st.warning("Please log in to continue.")
+    st.info("Default demo user: user1 / ChangeMe123!")
+    st.stop()
+
+if "user_id" not in st.session_state:
+    st.session_state.user_id = username
 
 
 # 2. CHAT MEMORY INITIALIZATION
 if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.session_state.messages = load_history(username)
 if "result" not in st.session_state:
     st.session_state.result = {}
 
@@ -77,20 +94,30 @@ def export_pdf(messages):
 # 3. SIDEBAR UI
 with st.sidebar:
     st.title("🚗 Trip Control Panel")
+    st.caption(f"Logged in as: **{name}**")
+    authenticator.logout("Logout", "sidebar")
 
     # -------------------------
     # 1. TRAVEL PROFILE (HIGH VALUE)
     # -------------------------
     st.subheader("👥 Travelers")
 
+    saved_trip_context = load_preferences(username) or {}
+    traveler_options = ["Solo Traveler", "Couple", "Family with Kids", "Elderly Parents", "Friends"]
+    trip_style_options = ["Balanced", "Fastest route", "Scenic route", "Budget-focused", "Relaxed"]
+
     traveler_type = st.selectbox(
         "Who is traveling?",
-        ["Solo Traveler", "Couple", "Family with Kids", "Elderly Parents", "Friends"]
+        traveler_options,
+        index=traveler_options.index(saved_trip_context.get("traveler_type"))
+        if saved_trip_context.get("traveler_type") in traveler_options else 0,
     )
 
     trip_style = st.radio(
         "Trip style",
-        ["Balanced", "Fastest route", "Scenic route", "Budget-focused", "Relaxed"]
+        trip_style_options,
+        index=trip_style_options.index(saved_trip_context.get("trip_style"))
+        if saved_trip_context.get("trip_style") in trip_style_options else 0,
     )
 
     # -------------------------
@@ -98,10 +125,11 @@ with st.sidebar:
     # -------------------------
     st.subheader("⚙️ Preferences")
 
-    avoid_tolls = st.checkbox("Avoid toll roads")
-    avoid_highways = st.checkbox("Prefer scenic roads")
-    short_drives = st.checkbox("Limit long driving hours")
-    highways = st.checkbox("Prefer highways for faster travel")
+    saved_prefs = saved_trip_context.get("preferences", {})
+    avoid_tolls = st.checkbox("Avoid toll roads", value=bool(saved_prefs.get("avoid_tolls", False)))
+    avoid_highways = st.checkbox("Prefer scenic roads", value=bool(saved_prefs.get("avoid_highways", False)))
+    short_drives = st.checkbox("Limit long driving hours", value=bool(saved_prefs.get("short_drives", False)))
+    highways = st.checkbox("Prefer highways for faster travel", value=bool(saved_prefs.get("highways", False)))
     
     # -------------------------
     trip_context = {
@@ -114,6 +142,7 @@ with st.sidebar:
         "highways": highways
         }
     }
+    save_preferences(username, trip_context)
     
     # 3. SYSTEM INFO (OPTIONAL BUT USEFUL)
     # -------------------------
@@ -159,7 +188,7 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-st.title("🚗 EuroRoad Advisor")
+st.title("🚗 Euro Road Trip Advisor")
 st.caption(f"Currently advising for a **{traveler_type}** with **{trip_style}** trip.")
 st.markdown("---")
 
@@ -182,6 +211,7 @@ if prompt := st.chat_input("Ask about your route, driving laws, or stopovers..."
     else:  
         # --- STEP B: ADD USER MESSAGE TO UI ---
         st.session_state.messages.append({"role": "user", "content": prompt})
+        save_message(username, "user", prompt)
         with st.chat_message("user"):
             st.markdown(prompt)
 
@@ -198,7 +228,13 @@ if prompt := st.chat_input("Ask about your route, driving laws, or stopovers..."
                 # Execute the Agent-based RAG Pipeline. 
                 # In 1.2.x, result is now a dictionary containing 'messages' and 'steps' (the modern equivalent of intermediate_steps).
                 # The agent now decides if it needs weather, fuel, or the knowledge base
-                result = get_response(prompt, chat_history=chat_history, traveler_type=traveler_type, trip_context=trip_context)
+                result = get_response(
+                    prompt,
+                    chat_history=chat_history,
+                    traveler_type=traveler_type,
+                    trip_context=trip_context,
+                    user_id=username,
+                )
                 st.session_state.result = result
                 
                 status.update(label="✅ Decision Made & Advice Generated", state="complete")
@@ -207,6 +243,15 @@ if prompt := st.chat_input("Ask about your route, driving laws, or stopovers..."
             # The last message in the list is the AI's final response
             final_answer = result["answer"]
             st.markdown(final_answer)
+            if result.get("map_data"):
+                map_data = result["map_data"]
+                route_map = render_route_map(
+                    map_data["polyline"],
+                    map_data["start_city"],
+                    map_data["end_city"],
+                )
+                if route_map is not None:
+                    st_folium(route_map, width=700, height=420, returned_objects=[])
 
             # 2. Display Evidence & Explainability (Intermediate Steps)
             with st.expander("🔍 System Logic: Tools & Knowledge Base Chunks"):
@@ -230,3 +275,4 @@ if prompt := st.chat_input("Ask about your route, driving laws, or stopovers..."
 
         # --- STEP D: STORE ASSISTANT MESSAGE ---
         st.session_state.messages.append({"role": "assistant", "content": final_answer})
+        save_message(username, "assistant", final_answer)

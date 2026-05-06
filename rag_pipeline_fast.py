@@ -10,16 +10,32 @@ except ImportError:
 
 import os
 import json
+from uuid import uuid4
+from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
-from tools import get_weather_forecast, estimate_fuel_cost, calculate_toll_vignette
+from tools import get_weather_forecast, estimate_fuel_cost, calculate_route_and_tolls
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langsmith import traceable
+import importlib
 
+
+def _load_sqlite_saver():
+    """
+    Load SqliteSaver lazily to avoid static import resolution errors
+    in environments where LangGraph sqlite extras are not installed.
+    """
+    try:
+        module = importlib.import_module("langgraph.checkpoint.sqlite")
+        return getattr(module, "SqliteSaver", None)
+    except Exception:
+        return None
+
+
+SqliteSaver = _load_sqlite_saver()
 
 # --- 1. SETUP VECTOR STORE ---
 
@@ -33,6 +49,13 @@ vectorstore = Chroma(
 )
 
 retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+
+checkpointer = None
+if SqliteSaver is not None:
+    try:
+        checkpointer = SqliteSaver.from_conn_string(str(current_dir / "checkpoints.sqlite"))
+    except Exception:
+        checkpointer = None
 
 
 # --- 2. MODELS ---
@@ -83,6 +106,7 @@ def route_query(user_query: str, chat_history: list):
     - weather → ONLY weather, temperature, forecast, climate, rain, sun
     - fuel → calculation of fuel cost, petrol, gas, cost of driving
     - toll → tolls, vignette, road charges
+    - route → shortest route, fastest route, distance between two cities, driving duration
     - rag → driving laws, speed limits, safety rules, regulations Only.
     - itinerary → ANY request involving planning trips, schedules, activities, travel plans, sightseeing, 
       "3 days in X", "plan a trip", "what should I do in X","itinerary for X", "best stops in X", "where to visit in X", etc.
@@ -114,30 +138,15 @@ def route_query(user_query: str, chat_history: list):
         return {"intent": "rag"}  # safe fallback
     
 # ---3.1 HELPER: Extract parameters for tools ---
-import json
 
 def extract_tool_params(user_query: str, intent: str, chat_history: list):
     history_text = "\n".join(
-    [f"{m['role']}: {m['content']}" for m in chat_history[-5:]]
-  )
+        [f"{m['role']}: {m['content']}" for m in chat_history[-5:]]
+    )
     prompt = f"""
-You are a STRICT parameter extraction system.
-Use conversation history to resolve references like:
-- "there"
-- "that city"
-- "same place"
-- "it"
-
-Extract ONLY valid JSON for the given intent.
-------------------------------------
-IMPORTANT RULE:
-If a city or destination is mentioned,
-you MUST estimate realistic driving distance
-from Munich, Germany.
-
-Use approximate European driving distances.
-
-------------------------------------
+You are a strict JSON parameter extractor.
+Use conversation history for references like "there", "it", "same city".
+Return ONLY valid JSON and nothing else.
 
 INTENT RULES:
 
@@ -148,30 +157,8 @@ fuel:
 {{"distance_km": number}}
 
 toll:
-{{"country": "string"}}
-
-------------------------------------
-EXAMPLES:
-
-"weather in Berlin"
-→ {{"city": "Berlin"}}
-
-"fuel cost for trip to Berlin"
-→ {{"distance_km": 580}}
-
-"drive to Paris"
-→ {{"distance_km": 850}}
-
-"toll in Switzerland"
-→ {{"country": "Switzerland"}}
-
-------------------------------------
-RULES:
-- Return ONLY JSON
-- No explanation
-- No extra text
-- If missing info, infer from context and estimate reasonably if possible
-- If still unclear, return {{}} ONLY as last resort
+route or toll:
+{{"start_city": "string", "end_city": "string", "routing_mode": "short|fast"}}
 
 Conversation history: {history_text}
 Intent: {intent}
@@ -195,9 +182,38 @@ Query: {user_query}
         return None
 
 
+def save_langgraph_checkpoint(user_id: str, payload: dict):
+    # Best-effort checkpoint write. Kept optional to avoid blocking responses.
+    if not checkpointer:
+        return
+    try:
+        checkpoint = {
+            "v": 1,
+            "id": str(uuid4()),
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "channel_values": payload,
+            "channel_versions": {},
+            "versions_seen": {},
+        }
+        checkpointer.put(
+            {"configurable": {"thread_id": user_id}},
+            checkpoint,
+            {},
+            {},
+        )
+    except Exception:
+        pass
+
+
 # --- 4. MAIN FUNCTION ---
 @traceable(name="Main RAG Pipeline")
-def get_response(user_query: str, chat_history: list, traveler_type: str = "Standard", trip_context: dict = None):
+def get_response(
+    user_query: str,
+    chat_history: list,
+    traveler_type: str = "Standard",
+    trip_context: dict = None,
+    user_id: str = "anonymous",
+):
     """
     Main pipeline:
     - Uses memory
@@ -209,7 +225,7 @@ def get_response(user_query: str, chat_history: list, traveler_type: str = "Stan
     from tools import (
         get_weather_forecast,
         estimate_fuel_cost,
-        calculate_toll_vignette
+        calculate_route_and_tolls,
     )
 
     # --- MEMORY (LIMITED) ---
@@ -247,16 +263,36 @@ def get_response(user_query: str, chat_history: list, traveler_type: str = "Stan
         steps.append({"tool": "fuel", "output": result})
         context = result
 
-    elif intent == "toll":
-        params = extract_tool_params(user_query, "toll", chat_history)
-        if not params or "country" not in params:
+    elif intent in {"toll", "route"}:
+        params = extract_tool_params(user_query, "route", chat_history)
+        if not params or "start_city" not in params or "end_city" not in params:
             return {
-            "answer": "I couldn't determine the country for the toll calculation. Please specify the country.",
+            "answer": "I couldn't detect both start and end city. Please provide them, e.g. 'Munich to Paris'.",
             "steps": []
             }
-        result = calculate_toll_vignette.invoke(params)
-        steps.append({"tool": "toll", "output": result})
-        context = result
+        routing_mode = params.get("routing_mode", "short")
+        if trip_context and trip_context.get("trip_style") == "Fastest route":
+            routing_mode = "fast"
+        result = calculate_route_and_tolls.invoke(
+            {
+                "start_city": params["start_city"],
+                "end_city": params["end_city"],
+                "avoid_tolls": bool(trip_context["preferences"]["avoid_tolls"]) if trip_context else False,
+                "routing_mode": routing_mode,
+            }
+        )
+        steps.append({"tool": "route_and_tolls", "output": result})
+        if isinstance(result, dict) and result.get("error"):
+            context = result["error"]
+        else:
+            context = (
+                f"Route: {result['start_city']} -> {result['end_city']}\n"
+                f"Distance: {result['distance_km']} km\n"
+                f"Duration: {result['duration_min']} min\n"
+                f"Total toll: EUR {result['total_toll_eur']}\n"
+                f"Country tolls: {result.get('country_tolls', [])}\n"
+                f"Warnings: {result.get('warnings', [])}"
+            )
 
     elif intent == "itinerary":
         style = trip_context.get("trip_style")
@@ -319,19 +355,38 @@ def get_response(user_query: str, chat_history: list, traveler_type: str = "Stan
     - Don't guess. 
     - Always respect preferences.
     - Adjust itinerary style based on trip_style.
+    - If the user is traveling through the Alps (Austria, Switzerland, France, Italy), remind them that high-altitude tunnels and passes often charge extra fees in addition to the standard tolls or vignettes."
+    - For route/toll questions, strictly use the tool output for distance, duration, and toll prices.
     - If the user asks for an itinerary, create a simple 1-day plan with 3-5 stops or stopovers based on the context and preferences.
     - In case of contradictions between user query and trip_context, always prioritize user query but mention the contradiction in the answer.
     - If the user asks for an itinerary but the intent was misclassified and you have RAG context, try to incorporate that context into a mini-itinerary or list of recommendations.
     - In case of preferenes that conflict (e.g., user wants to avoid highways but also prefers them), mention the conflict and provide a balanced recommendation.
     - Refuse anything unrelated.
+    - For Poland tolls, recommend toll-free routes if the user wants to avoid tolls, but also mention that the A1,A2, A4 has a private toll section. If they want tolls, show the cost of A1 = 7€, A2 = 32€ or A4 = 8€ and that it's the fastest route.
+    - For real time information on Tolls, the user should be directed to official toll websites or apps. Always provide a disclaimer about checking current toll prices before traveling, especially for routes with known variability like those in Poland. 
     - If Intent was "chitchat", respond in a friendly and conversational manner without providing travel advice and don't use Context.
     """
 
     response = answer_llm.invoke(final_prompt)
     usage = getattr(response, "response_metadata", {}).get("token_usage", {})
     
-    return {
+    save_langgraph_checkpoint(
+        user_id,
+        {"last_query": user_query, "last_intent": intent, "last_answer": response.content},
+    )
+
+    payload = {
         "answer": response.content,
         "steps": steps,
-        "usage": usage
+        "usage": usage,
     }
+    if intent in {"toll", "route"} and isinstance(result, dict) and result.get("polyline"):
+        payload["map_data"] = {
+            "polyline": result["polyline"],
+            "start_city": result["start_city"],
+            "end_city": result["end_city"],
+            "distance_km": result["distance_km"],
+            "duration_min": result["duration_min"],
+            "total_toll_eur": result["total_toll_eur"],
+        }
+    return payload
