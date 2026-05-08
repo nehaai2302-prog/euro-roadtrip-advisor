@@ -40,7 +40,7 @@ A **Streamlit** web app: an AI assistant for **European road trips**, combining 
 ### 1. Clone and enter the project
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/nehaai2302-prog/euro-roadtrip-advisor.git
 cd project3
 ```
 
