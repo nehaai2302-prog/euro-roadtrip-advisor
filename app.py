@@ -1,4 +1,5 @@
 import os
+from uuid import uuid4
 from dotenv import load_dotenv
 import streamlit as st
 import json
@@ -10,10 +11,26 @@ from reportlab.lib.styles import getSampleStyleSheet
 from streamlit_folium import st_folium
 
 # Import your custom modules
-from rag_pipeline_fast import estimate_cost
+from rag_pipeline import (
+    estimate_cost,
+    get_response,
+)
 from safety import check_safety
-from auth import get_authenticator
-from db import init_db, load_history, save_message, load_preferences, save_preferences
+from auth import (
+    authenticate_user,
+    register_user,
+    request_password_reset,
+    reset_password_with_token,
+)
+from db import (
+    init_db,
+    load_history,
+    save_message,
+    load_preferences,
+    save_preferences,
+    load_last_route,
+    save_last_route,
+)
 from map_utils import render_route_map
 
 # NOTE: Run python ingest.py first to build the vector database (./vectordb).
@@ -39,26 +56,49 @@ os.environ["OPENAI_API_KEY"] = api_key
 st.set_page_config(page_title="Euro Road Trip Advisor", page_icon="🚗", layout="wide")
 init_db()
 
-authenticator = get_authenticator()
-name, authentication_status, username = authenticator.login("main")
-
-if authentication_status is False:
-    st.error("Invalid username or password.")
-    st.stop()
-if authentication_status is None:
-    st.warning("Please log in to continue.")
-    st.info("Default demo user: user1 / ChangeMe123!")
-    st.stop()
-
-if "user_id" not in st.session_state:
-    st.session_state.user_id = username
+if "auth_user" not in st.session_state:
+    st.session_state.auth_user = None
+if "guest_session_id" not in st.session_state:
+    st.session_state.guest_session_id = f"guest-{uuid4().hex[:8]}"
+if "active_user_id" not in st.session_state:
+    st.session_state.active_user_id = st.session_state.guest_session_id
 
 
 # 2. CHAT MEMORY INITIALIZATION
 if "messages" not in st.session_state:
-    st.session_state.messages = load_history(username)
+    st.session_state.messages = []
 if "result" not in st.session_state:
     st.session_state.result = {}
+if "last_route" not in st.session_state:
+    st.session_state.last_route = {}
+if "last_route_scope" not in st.session_state:
+    st.session_state.last_route_scope = None
+
+
+def _routing_scope_user_id() -> str:
+    """Username when logged in; stable guest id when not."""
+    return st.session_state.auth_user or st.session_state.guest_session_id
+
+
+def _sync_last_route_from_db():
+    scope = _routing_scope_user_id()
+    if st.session_state.last_route_scope != scope:
+        row = load_last_route(scope)
+        st.session_state.last_route = row if row else {}
+        st.session_state.last_route_scope = scope
+
+
+def _persist_last_route_session(start_city, end_city, routing_mode="fast"):
+    if not start_city or not end_city:
+        return
+    rm = routing_mode if routing_mode in ("short", "fast") else "fast"
+    st.session_state.last_route = {
+        "start_city": str(start_city).strip(),
+        "end_city": str(end_city).strip(),
+        "routing_mode": rm,
+    }
+    save_last_route(_routing_scope_user_id(), start_city, end_city, rm)
+
 
 # 2.1 JSON Export Function
 def export_json(messages):
@@ -91,23 +131,146 @@ def export_pdf(messages):
     buffer.seek(0)
     return buffer
 
+
+def _logout_user():
+    st.session_state.auth_user = None
+    st.session_state.active_user_id = st.session_state.guest_session_id
+    st.session_state.messages = []
+    st.session_state.last_route_scope = None
+    st.session_state.last_route = {}
+    st.rerun()
+
+
+def _format_tool_output_for_display(tool_name: str, tool_output):
+    """Avoid dumping huge coordinate lists (ORS polyline) into the debug panel."""
+    if not isinstance(tool_output, dict):
+        return tool_output
+    if tool_name != "route_and_tolls" or "polyline" not in tool_output:
+        return tool_output
+    summary = {k: v for k, v in tool_output.items() if k != "polyline"}
+    poly = tool_output.get("polyline")
+    if isinstance(poly, list):
+        summary["polyline_point_count"] = len(poly)
+        summary["polyline_note"] = "Omitted from debug view; shown on map above."
+    elif poly:
+        summary["polyline_note"] = "Encoded geometry (truncated in UI if very long)."
+    return summary
+
+
+def render_account_forms(key_prefix: str = "account"):
+    auth_tab, signup_tab, reset_tab = st.tabs(["Sign in", "Create account", "Reset password"])
+
+    with auth_tab:
+        if st.session_state.auth_user:
+            st.success(f"Logged in as: {st.session_state.auth_user}")
+            if st.button("Logout", key=f"{key_prefix}_logout_btn"):
+                _logout_user()
+        else:
+            login_user = st.text_input("Username", key=f"{key_prefix}_login_username")
+            login_pass = st.text_input("Password", type="password", key=f"{key_prefix}_login_password")
+            if st.button("Login", key=f"{key_prefix}_login_btn"):
+                if authenticate_user(login_user, login_pass):
+                    st.session_state.auth_user = login_user
+                    st.session_state.active_user_id = login_user
+                    st.session_state.messages = load_history(login_user)
+                    st.session_state.last_route_scope = None
+                    st.success("Logged in successfully.")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password.")
+            st.caption("You can continue as guest without login.")
+
+    with signup_tab:
+        new_user = st.text_input("New username", key=f"{key_prefix}_signup_username")
+        new_email = st.text_input("Email", key=f"{key_prefix}_signup_email")
+        new_pass = st.text_input("New password", type="password", key=f"{key_prefix}_signup_password")
+        new_pass2 = st.text_input("Confirm password", type="password", key=f"{key_prefix}_signup_password2")
+        if st.button("Create account", key=f"{key_prefix}_create_account_btn"):
+            if new_pass != new_pass2:
+                st.error("Passwords do not match.")
+            else:
+                ok, msg = register_user(new_user, new_email, new_pass)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+
+    with reset_tab:
+        st.caption("Step 1: Request a reset token with your username or email.")
+        reset_identifier = st.text_input("Username or email", key=f"{key_prefix}_reset_identifier")
+        if st.button("Generate reset token", key=f"{key_prefix}_generate_reset_token_btn"):
+            ok, msg, reset_token = request_password_reset(reset_identifier)
+            if ok:
+                st.success(msg)
+                if reset_token:
+                    st.warning("Development mode: copy this token now. It is shown only once.")
+                    st.code(reset_token)
+            else:
+                st.error(msg)
+
+        st.divider()
+        st.caption("Step 2: Use token to set a new password.")
+        token_input = st.text_input("Reset token", key=f"{key_prefix}_reset_token_input")
+        new_reset_password = st.text_input("New password", type="password", key=f"{key_prefix}_new_reset_password")
+        confirm_reset_password = st.text_input(
+            "Confirm new password",
+            type="password",
+            key=f"{key_prefix}_confirm_reset_password",
+        )
+        if st.button("Reset password", key=f"{key_prefix}_reset_password_btn"):
+            ok, msg = reset_password_with_token(token_input, new_reset_password, confirm_reset_password)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+
+_sync_last_route_from_db()
+
 # 3. SIDEBAR UI
+open_account_panel = False
+supports_dialog = hasattr(st, "dialog")
 with st.sidebar:
     st.title("🚗 Trip Control Panel")
-    st.caption(f"Logged in as: **{name}**")
-    authenticator.logout("Logout", "sidebar")
+    st.subheader("🔐 Account")
+    if st.session_state.auth_user:
+        st.success(f"Logged in as: {st.session_state.auth_user}")
+        account_col, logout_col = st.columns([1.4, 1])
+        with account_col:
+            if st.button("Manage account", key="sidebar_account_btn"):
+                open_account_panel = True
+        with logout_col:
+            if st.button("Logout", key="sidebar_logout_btn"):
+                _logout_user()
+    else:
+        st.info("Guest mode (not signed in)")
+        if st.button("Sign in", key="sidebar_login_btn"):
+            open_account_panel = True
+    st.divider()
 
     # -------------------------
-    # 1. TRAVEL PROFILE (HIGH VALUE)
+    # 1. TRIP START (optional default for inferred routes / itinerary)
     # -------------------------
-    st.subheader("👥 Travelers")
+    st.subheader("🏁 Starting Location")
+    source_city = st.text_input(
+        "Starting point",
+        key="sidebar_starting_point",
+        placeholder="e.g. Munich",
+    )
 
-    saved_trip_context = load_preferences(username) or {}
-    traveler_options = ["Solo Traveler", "Couple", "Family with Kids", "Elderly Parents", "Friends"]
+    # -------------------------
+    # 2. TRAVEL PROFILE (HIGH VALUE)
+    # -------------------------
+    st.subheader("👥 Travellers")
+
+    current_user = st.session_state.auth_user
+    saved_trip_context = load_preferences(current_user) if current_user else {}
+    if not saved_trip_context:
+        saved_trip_context = {}
+    traveler_options = ["Solo Traveller", "Couple", "Family with Kids", "Elderly Parents", "Friends"]
     trip_style_options = ["Balanced", "Fastest route", "Scenic route", "Budget-focused", "Relaxed"]
 
     traveler_type = st.selectbox(
-        "Who is traveling?",
+        "Who is travelling?",
         traveler_options,
         index=traveler_options.index(saved_trip_context.get("traveler_type"))
         if saved_trip_context.get("traveler_type") in traveler_options else 0,
@@ -121,7 +284,7 @@ with st.sidebar:
     )
 
     # -------------------------
-    # 2. PREFERENCES (REAL VALUE)
+    # 3. PREFERENCES (REAL VALUE)
     # -------------------------
     st.subheader("⚙️ Preferences")
 
@@ -135,6 +298,8 @@ with st.sidebar:
     trip_context = {
     "traveler_type": traveler_type,
     "trip_style": trip_style,
+    "source_city": source_city.strip(),
+    "last_route": st.session_state.last_route,
     "preferences": {
         "avoid_tolls": avoid_tolls,
         "avoid_highways": avoid_highways,
@@ -142,7 +307,8 @@ with st.sidebar:
         "highways": highways
         }
     }
-    save_preferences(username, trip_context)
+    if current_user:
+        save_preferences(current_user, trip_context)
     
     # 3. SYSTEM INFO (OPTIONAL BUT USEFUL)
     # -------------------------
@@ -190,6 +356,20 @@ with st.sidebar:
 
 st.title("🚗 Euro Road Trip Advisor")
 st.caption(f"Currently advising for a **{traveler_type}** with **{trip_style}** trip.")
+
+if supports_dialog:
+    @st.dialog("Manage account")
+    def show_account_dialog():
+        render_account_forms("dialog")
+
+    if open_account_panel:
+        show_account_dialog()
+else:
+    with st.sidebar.expander("Account", expanded=False):
+        render_account_forms("sidebar_expander")
+
+if not st.session_state.auth_user:
+    st.info("Start chatting instantly in guest mode, or log in to save your conversations and preferences across sessions.")
 st.markdown("---")
 
 # 4. DISPLAY CHAT HISTORY
@@ -211,20 +391,20 @@ if prompt := st.chat_input("Ask about your route, driving laws, or stopovers..."
     else:  
         # --- STEP B: ADD USER MESSAGE TO UI ---
         st.session_state.messages.append({"role": "user", "content": prompt})
-        save_message(username, "user", prompt)
+        if st.session_state.auth_user:
+            save_message(st.session_state.auth_user, "user", prompt)
         with st.chat_message("user"):
             st.markdown(prompt)
+
+        MAX_HISTORY = 10
 
         # --- STEP C: EXECUTION (Agent-based Tools + RAG) ---
         with st.chat_message("assistant"):
             # We use st.status to show the Agent's reasoning process
             with st.status("🤖 AI Travel Advisor processing...", expanded=True) as status:
                 # ✅ NEW: Limit memory size (prevents token overflow & improves speed)
-                MAX_HISTORY = 10
                 chat_history = st.session_state.messages[-MAX_HISTORY:]
-                
-                from rag_pipeline_fast import get_response
-                
+
                 # Execute the Agent-based RAG Pipeline. 
                 # In 1.2.x, result is now a dictionary containing 'messages' and 'steps' (the modern equivalent of intermediate_steps).
                 # The agent now decides if it needs weather, fuel, or the knowledge base
@@ -233,7 +413,7 @@ if prompt := st.chat_input("Ask about your route, driving laws, or stopovers..."
                     chat_history=chat_history,
                     traveler_type=traveler_type,
                     trip_context=trip_context,
-                    user_id=username,
+                    user_id=st.session_state.auth_user,
                 )
                 st.session_state.result = result
                 
@@ -245,6 +425,37 @@ if prompt := st.chat_input("Ask about your route, driving laws, or stopovers..."
             st.markdown(final_answer)
             if result.get("map_data"):
                 map_data = result["map_data"]
+                _persist_last_route_session(
+                    map_data.get("start_city"),
+                    map_data.get("end_city"),
+                    map_data.get("routing_mode", "fast"),
+                )
+                if map_data.get("show_toll_banner"):
+                    if map_data.get("toll_disclaimer"):
+                        confidence = map_data.get("toll_confidence", "unknown")
+                        st.info(f"Toll confidence: {confidence}. {map_data['toll_disclaimer']}")
+                    breakdown = map_data.get("toll_breakdown_estimate") or []
+                    if breakdown:
+                        with st.expander("Approximate toll / vignette guidance by country"):
+                            for row in breakdown:
+                                title = row.get("country_name") or row.get("country_code") or "Country"
+                                st.markdown(f"**{title}** — {row.get('summary', '')}")
+                                if row.get("illustrative_note"):
+                                    st.caption(row["illustrative_note"])
+                                for v in row.get("vignettes") or []:
+                                    pe = v.get("price_eur")
+                                    pe_s = f"€{float(pe):.2f}" if isinstance(pe, (int, float)) else str(pe)
+                                    st.markdown(
+                                        f"- **{v.get('type', '')}**: {pe_s} — {v.get('scope', '')}"
+                                    )
+                                for s in row.get("section_tolls") or []:
+                                    pe = s.get("price_eur")
+                                    pe_s = f"€{float(pe):.2f}" if isinstance(pe, (int, float)) else str(pe)
+                                    st.markdown(
+                                        f"- **{s.get('road', '')}** ({s.get('type', '')}): {pe_s}"
+                                    )
+                                if row.get("official_url"):
+                                    st.markdown(f"[Official info]({row['official_url']})")
                 route_map = render_route_map(
                     map_data["polyline"],
                     map_data["start_city"],
@@ -252,6 +463,14 @@ if prompt := st.chat_input("Ask about your route, driving laws, or stopovers..."
                 )
                 if route_map is not None:
                     st_folium(route_map, width=700, height=420, returned_objects=[])
+
+            lr_upd = result.get("last_route_update")
+            if isinstance(lr_upd, dict) and lr_upd.get("start_city") and lr_upd.get("end_city"):
+                _persist_last_route_session(
+                    lr_upd["start_city"],
+                    lr_upd["end_city"],
+                    lr_upd.get("routing_mode", "fast"),
+                )
 
             # 2. Display Evidence & Explainability (Intermediate Steps)
             with st.expander("🔍 System Logic: Tools & Knowledge Base Chunks"):
@@ -270,9 +489,14 @@ if prompt := st.chat_input("Ask about your route, driving laws, or stopovers..."
                             # This displays the text chunks returned by your retriever
                             st.markdown(tool_output)
                         else:
-                            # This displays results from weather or fuel tools
-                            st.success(f"📊 **Tool Output:** {tool_output}")
+                            display_out = _format_tool_output_for_display(tool_name, tool_output)
+                            if isinstance(display_out, dict):
+                                st.success("📊 **Tool output** (summary; large fields omitted)")
+                                st.json(display_out)
+                            else:
+                                st.success(f"📊 **Tool Output:** {display_out}")
 
         # --- STEP D: STORE ASSISTANT MESSAGE ---
         st.session_state.messages.append({"role": "assistant", "content": final_answer})
-        save_message(username, "assistant", final_answer)
+        if st.session_state.auth_user:
+            save_message(st.session_state.auth_user, "assistant", final_answer)

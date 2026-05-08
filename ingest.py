@@ -32,7 +32,7 @@ def run_ingestion():
 
     # STEP 1: LOAD DOCUMENTS
     # DirectoryLoader handles multiple files at once
-    loader = DirectoryLoader(DATA_PATH, glob="*.txt", loader_cls=TextLoader)
+    loader = DirectoryLoader(DATA_PATH, glob="*.txt", loader_cls=lambda path: TextLoader(path, encoding="utf-8"))
     raw_documents = loader.load()
     print(f"📄 Successfully loaded {len(raw_documents)} documents.")
 

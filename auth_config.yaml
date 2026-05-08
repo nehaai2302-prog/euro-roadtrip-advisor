@@ -1,0 +1,12 @@
+credentials:
+  usernames:
+    user1:
+      email: user1@example.com
+      name: User 1
+      password: $2b$12$0JdQzrWqKql.0YaS/qaJTeta5Zah7MUm3Rx3C8zcIxbf5y7HIMv62
+cookie:
+  name: euroroad_auth
+  key: replace_with_secure_cookie_key
+  expiry_days: 30
+preauthorized:
+  emails: []

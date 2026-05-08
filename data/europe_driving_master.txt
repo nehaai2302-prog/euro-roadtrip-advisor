@@ -6,7 +6,29 @@
 - EQUIPMENT: 1 reflective vest per occupant (stored in cabin) and 1 warning triangle are mandatory.
 
 ## REGION: ALPINE COUNTRIES (Switzerland, Austria)
-- HIGHWAYS: Switzerland requires a physical or e-vignette (40 CHF). Austria requires a 1-day, 10-day, or annual vignette.
+- HIGHWAYS: Switzerland requires a physical or e-vignette (40 CHF). Austria (Vienna and all motorway driving): vignette required on Autobahnen; separate section tolls apply on some corridors in addition to the vignette. Confirm current tariffs on https://www.asfinag.at/
+
+### Austria reference toll records (passenger cars — illustrative; verify on ASFINAG)
+Record 1: Vignettes
+
+TOLL_RECORD: [Country: Austria] [Type: 1-Day Digital] [Price: 9.60 EUR] [Scope: All Autobahns]
+
+TOLL_RECORD: [Country: Austria] [Type: 10-Day Sticker/Digital] [Price: 12.80 EUR] [Scope: All Autobahns]
+
+TOLL_RECORD: [Country: Austria] [Type: 2-Month Sticker/Digital] [Price: 32.00 EUR] [Scope: All Autobahns]
+
+TOLL_RECORD: [Country: Austria] [Type: Annual Sticker/Digital] [Price: 106.80 EUR] [Scope: All Autobahns]
+
+Record 2: Section Tolls (Extra Fees)
+
+TOLL_RECORD: [Country: Austria] [Road: A13 Brenner] [Type: Section Toll] [Price: 12.50 EUR]
+
+TOLL_RECORD: [Country: Austria] [Road: A10 Tauern] [Type: Section Toll] [Price: 15.00 EUR]
+
+TOLL_RECORD: [Country: Austria] [Road: S16 Arlberg] [Type: Section Toll] [Price: 13.00 EUR]
+
+TOLL_RECORD: [Country: Austria] [Road: A9 Gleinalm] [Type: Section Toll] [Price: 12.00 EUR]
+
 - WINTER: From Nov 1 to April 15, winter tires are mandatory. Snow chains must be in the trunk if driving in mountain passes.
 - LIGHTS: Daytime running lights are mandatory year-round in Switzerland.
 

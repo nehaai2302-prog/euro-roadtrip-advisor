@@ -5,6 +5,7 @@ import hashlib
 from langchain_core.tools import tool
 from dotenv import load_dotenv
 from db import get_geocode, set_geocode, get_route_cache, set_route_cache
+from toll_estimate import attach_toll_guidance, extra_breakdown_lines, refresh_toll_breakdown_from_catalog
 
 load_dotenv()
 
@@ -43,26 +44,55 @@ def _cache_key(*parts: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+ORS_DIRECTIONS_GEOJSON_URL = (
+    "https://api.openrouteservice.org/v2/directions/driving-car/geojson"
+)
+ORS_REQUEST_TIMEOUT_S = 45
+
+
+def _ors_error_detail(response: requests.Response) -> str:
+    try:
+        data = response.json()
+    except Exception:
+        text = (response.text or "").strip()
+        return text[:500] if text else (response.reason or "Unknown error")
+    err = data.get("error")
+    if isinstance(err, dict):
+        msg = err.get("message")
+        code = err.get("code")
+        if msg and code is not None:
+            return f"{msg} (ORS code {code})"
+        return msg or str(err)
+    if isinstance(err, str):
+        return err
+    return str(data)[:500]
+
+
+def _ors_post_directions(api_key: str, body: dict) -> requests.Response:
+    return requests.post(
+        ORS_DIRECTIONS_GEOJSON_URL,
+        headers={"Authorization": api_key, "Content-Type": "application/json"},
+        json=body,
+        timeout=ORS_REQUEST_TIMEOUT_S,
+    )
+
+
 def geocode_city(city: str):
     cached = get_geocode(city)
     if cached:
         return cached
 
-    api_key = os.getenv("HERE_API_KEY")
-    if not api_key:
-        raise ValueError("HERE_API_KEY is not configured.")
-
     response = requests.get(
-        "https://geocode.search.hereapi.com/v1/geocode",
-        params={"q": city, "limit": 1, "apiKey": api_key},
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": city, "format": "json", "limit": 1},
+        headers={"User-Agent": "euro-road-trip-advisor/1.0"},
         timeout=8,
     )
     response.raise_for_status()
-    items = response.json().get("items", [])
+    items = response.json()
     if not items:
         raise ValueError(f"Could not geocode city: {city}")
-    position = items[0]["position"]
-    lat, lon = position["lat"], position["lng"]
+    lat, lon = float(items[0]["lat"]), float(items[0]["lon"])
     set_geocode(city, lat, lon)
     return lat, lon
 
@@ -74,76 +104,147 @@ def calculate_route_and_tolls(
     avoid_tolls: bool = False,
     routing_mode: str = "short",
 ) -> dict:
-    """Returns shortest/fastest route + toll breakdown from HERE Routing API."""
+    """Returns shortest/fastest route + toll metadata from ORS + Nominatim."""
     if routing_mode not in {"short", "fast"}:
         routing_mode = "short"
 
     key = _cache_key(start_city, end_city, avoid_tolls, routing_mode)
     cached = get_route_cache(key)
     if cached:
+        if not cached.get("toll_guidance_attached"):
+            attach_toll_guidance(cached)
+        else:
+            refresh_toll_breakdown_from_catalog(cached)
+        set_route_cache(key, cached, ttl_days=7)
         return cached
 
     o_lat, o_lon = geocode_city(start_city)
     d_lat, d_lon = geocode_city(end_city)
 
-    params = {
-        "transportMode": "car",
-        "origin": f"{o_lat},{o_lon}",
-        "destination": f"{d_lat},{d_lon}",
-        "routingMode": routing_mode,
-        "return": "summary,polyline,tolls",
-        "tolls[summaries]": "total,country",
-        "currency": "EUR",
-        "vehicle[type]": "car",
-        "lang": "en-US",
-        "apiKey": os.getenv("HERE_API_KEY"),
+    ors_api_key = os.getenv("ORS_API_KEY")
+    if not ors_api_key:
+        return {
+            "error": "ORS_API_KEY is not configured. Please add it to your environment.",
+            "distance_km": 0,
+            "duration_min": 0,
+            "total_toll_eur": None,
+            "toll_confidence": "low",
+            "toll_disclaimer": "Toll pricing is unavailable because routing provider is not configured.",
+        }
+
+    body = {
+        "coordinates": [[o_lon, o_lat], [d_lon, d_lat]],
+        "preference": "shortest" if routing_mode == "short" else "recommended",
     }
     if avoid_tolls:
-        params["avoid[features]"] = "tollRoad"
+        body["options"] = {"avoid_features": ["tollways"]}
 
-    response = requests.get(
-        "https://router.hereapi.com/v8/routes",
-        params=params,
-        timeout=8,
-    )
-    response.raise_for_status()
+    used_shortest_fallback = False
+    response = _ors_post_directions(ors_api_key, body)
+
+    if response.status_code == 401:
+        return {"error": "OpenRouteService API key is invalid or unauthorized.", "distance_km": 0, "duration_min": 0, "total_toll_eur": None}
+    if response.status_code == 429:
+        return {"error": "OpenRouteService rate limit reached. Please try again later.", "distance_km": 0, "duration_min": 0, "total_toll_eur": None}
+
+    if response.status_code != 200:
+        detail = _ors_error_detail(response)
+        # ORS uses HTTP 404 both for bad URLs and for "no route" / snapping failures (see ORS error docs).
+        if (
+            response.status_code == 404
+            and routing_mode == "short"
+            and body.get("preference") == "shortest"
+        ):
+            retry_body = dict(body)
+            retry_body["preference"] = "recommended"
+            response = _ors_post_directions(ors_api_key, retry_body)
+            used_shortest_fallback = True
+            if response.status_code != 200:
+                detail2 = _ors_error_detail(response)
+                return {
+                    "error": (
+                        "OpenRouteService could not build this route with shortest-distance preference "
+                        f"or with the fallback recommended profile. {detail2}"
+                    ),
+                    "distance_km": 0,
+                    "duration_min": 0,
+                    "total_toll_eur": None,
+                }
+        elif response.status_code != 200:
+            return {
+                "error": f"OpenRouteService error ({response.status_code}): {detail}",
+                "distance_km": 0,
+                "duration_min": 0,
+                "total_toll_eur": None,
+            }
+
     data = response.json()
-    routes = data.get("routes", [])
-    if not routes:
-        return {"error": "No route found.", "distance_km": 0, "duration_min": 0, "total_toll_eur": 0}
+    features = data.get("features", [])
+    if not features:
+        return {"error": "No route found.", "distance_km": 0, "duration_min": 0, "total_toll_eur": None}
 
-    route = routes[0]
-    section = route["sections"][0]
-    summary = section.get("summary", {})
-    toll_summary = route.get("tolls", {}).get("summary", {})
+    route = features[0]
+    props = route.get("properties", {})
+    summary = props.get("summary", {})
+    geometry = route.get("geometry", {})
+    coordinates = geometry.get("coordinates", [])
+    latlon_coords = [[coord[1], coord[0]] for coord in coordinates if len(coord) >= 2]
+
+    warnings = list(props.get("warnings") or [])
+    if used_shortest_fallback:
+        warnings.append(
+            "OpenRouteService did not return a shortest-distance route for this corridor; "
+            "showing recommended routing instead (often longer in km but reachable)."
+        )
 
     result = {
         "start_city": start_city,
         "end_city": end_city,
-        "distance_km": round(summary.get("length", 0) / 1000, 1),
+        "provider": "openrouteservice",
+        "distance_km": round(summary.get("distance", 0) / 1000, 1),
         "duration_min": round(summary.get("duration", 0) / 60, 1),
-        "total_toll_eur": round(toll_summary.get("total", {}).get("value", 0) or 0, 2),
-        "country_tolls": [
-            {
-                "country": row.get("countryCode"),
-                "eur": round(row.get("price", {}).get("value", 0) or 0, 2),
-            }
-            for row in toll_summary.get("country", [])
-        ],
-        "polyline": section.get("polyline"),
+        "total_toll_e ur": None,
+        "country_tolls": [],
+        "polyline": latlon_coords,
         "start": {"lat": o_lat, "lon": o_lon},
         "end": {"lat": d_lat, "lon": d_lon},
-        "warnings": [n.get("title", n.get("code")) for n in route.get("notices", [])],
+        "warnings": warnings,
     }
+    attach_toll_guidance(result)
     set_route_cache(key, result, ttl_days=7)
     return result
 
 
+def format_toll_estimate_text(result: dict) -> str:
+    """Human-readable approximate toll / vignette guidance from route tool output."""
+    parts = []
+    cc = result.get("countries_inferred") or []
+    if cc:
+        parts.append("Countries (sampled along route): " + ", ".join(cc))
+    note = result.get("toll_inference_note")
+    if note:
+        parts.append(note)
+    for row in result.get("toll_breakdown_estimate") or []:
+        nm = row.get("country_name") or row.get("country_code") or "?"
+        parts.append(f"- {nm}: {row.get('summary', '')}")
+        if row.get("illustrative_note"):
+            parts.append(f"  Illustrative: {row['illustrative_note']}")
+        for line in extra_breakdown_lines(row):
+            parts.append(line)
+        if row.get("official_url"):
+            parts.append(f"  Official info: {row['official_url']}")
+    disc = result.get("toll_disclaimer")
+    if disc:
+        parts.append("")
+        parts.append(disc)
+    return "\n".join(parts) if parts else "No toll guidance available."
+
+
 @tool
 def calculate_toll_vignette(countries_data: list) -> str:
-    """Backward-compatible wrapper that delegates to HERE route+toll calculation."""
+    """Approximate vignette / toll-system guidance for a city-to-city drive (no invoice-accurate totals)."""
     if not countries_data or len(countries_data) < 2:
-        return "Please provide at least start and end cities to calculate tolls."
+        return "Please provide at least start and end cities to estimate toll context."
     start_city = countries_data[0].get("city") or countries_data[0].get("country")
     end_city = countries_data[-1].get("city") or countries_data[-1].get("country")
     if not start_city or not end_city:
@@ -153,7 +254,7 @@ def calculate_toll_vignette(countries_data: list) -> str:
     )
     if isinstance(result, dict) and result.get("error"):
         return result["error"]
-    return f"Estimated toll: €{result.get('total_toll_eur', 0)}"
+    return format_toll_estimate_text(result)
 
 @tool
 def estimate_fuel_cost(distance_km: float) -> str:

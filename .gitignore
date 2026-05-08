@@ -17,5 +17,7 @@ venv/
 
 
 # Streamlit secrets file (keep it out of version control)
-.streamlit/
 .streamlit/secrets.toml
+
+# SQLite database file
+app_state.sqlite3
