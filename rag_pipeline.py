@@ -373,6 +373,138 @@ def save_langgraph_checkpoint(user_id: str, payload: dict):
         pass
 
 
+def default_eval_trip_context() -> dict:
+    """Neutral trip context for offline RAG evaluation (matches app shape)."""
+    return {
+        "traveler_type": "Standard",
+        "trip_style": "Balanced",
+        "source_city": "",
+        "last_route": {},
+        "preferences": {
+            "avoid_tolls": False,
+            "avoid_highways": False,
+            "short_drives": False,
+            "highways": False,
+        },
+    }
+
+
+def _normalize_trip_context(trip_context: dict | None) -> dict:
+    tc = dict(trip_context) if trip_context else {}
+    prefs = tc.get("preferences") or {}
+    return {
+        "traveler_type": tc.get("traveler_type", "Standard"),
+        "trip_style": tc.get("trip_style", "Balanced"),
+        "source_city": str(tc.get("source_city", "") or "").strip(),
+        "last_route": tc.get("last_route") or {},
+        "preferences": {
+            "avoid_tolls": bool(prefs.get("avoid_tolls", False)),
+            "avoid_highways": bool(prefs.get("avoid_highways", False)),
+            "short_drives": bool(prefs.get("short_drives", False)),
+            "highways": bool(prefs.get("highways", False)),
+        },
+    }
+
+
+def retrieve_rag_docs(user_query: str):
+    """Retrieve knowledge-base chunks for RAG (same k as production retriever)."""
+    return retriever.invoke(user_query)
+
+
+def invoke_final_answer(
+    user_query: str,
+    context: str,
+    chat_history: list,
+    trip_context: dict | None,
+    traveler_type: str,
+    intent: str,
+) -> tuple[str, dict]:
+    """
+    Build the production final prompt and return (answer_text, token_usage dict).
+    Used for all intents; ``context`` is tool output, KB text, or empty (chitchat).
+    """
+    history_text = "\n".join(
+        [f"{m['role']}: {m['content']}" for m in (chat_history or [])[-5:]]
+    )
+    tc = _normalize_trip_context(trip_context)
+    source_city = tc["source_city"]
+    prefs = tc["preferences"]
+    final_prompt = f"""
+    You are a Euro Road Trip Advisor for {traveler_type} trips.
+
+    Use the conversation history, provided context, and preferences to answer.
+
+    Conversation History:
+    {history_text}
+
+    TRIP CONTEXT:
+    - Traveler type: {tc.get('traveler_type')}
+    - Trip style: {tc.get('trip_style')}
+    - Source city (fallback): {source_city or "Not provided"}
+    - Preferences:
+    - Avoid tolls: {prefs['avoid_tolls']}
+    - Avoid highways: {prefs['avoid_highways']}
+    - Short drives: {prefs['short_drives']}
+    - Prefer highways: {prefs['highways']}
+
+    Context:
+    {context}
+
+    Question:
+    {user_query}
+
+    RULES:
+    - If context is available → use it
+    - Stay consistent with previous conversation
+    - If the answer is not in the context, say you don't know, but try to be helpful with general knowledge.
+    - Be concise and helpful. Don't be verbose.
+    - Don't guess. 
+    - Always respect preferences.
+    - Adjust itinerary style based on trip_style.
+    - For route duration in user-facing answers, present hours first (e.g., "about 3.5 hours"), with minutes in parentheses if useful.
+    - If routing mode is short, explicitly explain that shortest minimizes distance, not travel time, and therefore can take longer than fastest routes.
+    - If the user is traveling through the Alps (Austria, Switzerland, France, Italy), remind them that high-altitude tunnels and passes often charge extra fees in addition to the standard tolls or vignettes."
+    - For route/toll questions, strictly use the tool output for distance, duration, and toll prices.
+    - If the user asks for an itinerary, create a simple 1-day plan with 3-5 stops or stopovers based on the context and preferences.
+    - In case of contradictions between user query and trip_context, always prioritize user query but mention the contradiction in the answer.
+    - If the user asks for an itinerary but the intent was misclassified and you have RAG context, try to incorporate that context into a mini-itinerary or list of recommendations.
+    - In case of preferenes that conflict (e.g., user wants to avoid highways but also prefers them), mention the conflict and provide a balanced recommendation.
+    - Refuse anything unrelated.
+    - For Poland tolls, recommend toll-free routes if the user wants to avoid tolls, but also mention that the A1,A2, A4 has a private toll section. If they want tolls, show the cost of A1 = 7€, A2 = 32€ or A4 = 8€ but don't calulate the total.
+    - Do not attempt to calculate a "Total Estimated Toll" or sum up different highways. If a total is not explicitly provided in the retrieved data, state that the total cost depends on specific entry/exit points and recommend using an official calculator.
+    - For real time information on Tolls, the user should be directed to official toll websites or apps. Always provide a disclaimer about checking current toll prices before traveling, especially for routes with known variability like those in Poland. 
+    - If Intent was "chitchat", respond in a friendly and conversational manner without providing travel advice and don't use Context.
+    """
+
+    response = answer_llm.invoke(final_prompt)
+    usage = getattr(response, "response_metadata", {}).get("token_usage", {})
+    return response.content, usage
+
+
+def generate_rag_answer(
+    user_query: str,
+    retrieved_docs: list,
+    chat_history: list,
+    trip_context: dict | None,
+    traveler_type: str = "Standard",
+    *,
+    intent: str = "rag",
+) -> tuple[str, dict]:
+    """
+    Join retrieved LangChain documents into context and run the same final
+    answer step as production RAG (for Ragas / offline eval).
+    """
+    context = "\n\n".join(doc.page_content for doc in retrieved_docs)
+    return invoke_final_answer(
+        user_query,
+        context,
+        chat_history,
+        trip_context,
+        traveler_type,
+        intent,
+    )
+
+
 # --- 4. MAIN FUNCTION ---
 @traceable(name="Main RAG Pipeline")
 def get_response(
@@ -396,10 +528,6 @@ def get_response(
         calculate_route_and_tolls,
     )
 
-    # --- MEMORY (LIMITED) ---
-    history_text = "\n".join(
-        [f"{m['role']}: {m['content']}" for m in chat_history[-5:]]
-    )
     source_city = (trip_context or {}).get("source_city", "").strip()
 
     # --- ROUTING ---
@@ -621,7 +749,7 @@ def get_response(
                 "routing_mode": rm_rag if rm_rag in ("short", "fast") else "fast",
             }
 
-        docs = retriever.invoke(user_query)
+        docs = retrieve_rag_docs(user_query)
 
         chunks = "\n\n".join(doc.page_content for doc in docs)
 
@@ -633,63 +761,22 @@ def get_response(
         context = chunks
 
     # --- FINAL ANSWER GENERATION ---
-    final_prompt = f"""
-    You are a Euro Road Trip Advisor for {traveler_type} trips.
+    answer_text, usage = invoke_final_answer(
+        user_query,
+        context,
+        chat_history,
+        trip_context,
+        traveler_type,
+        intent,
+    )
 
-    Use the conversation history, provided context, and preferences to answer.
-
-    Conversation History:
-    {history_text}
-
-    TRIP CONTEXT:
-    - Traveler type: {trip_context.get('traveler_type')}
-    - Trip style: {trip_context.get('trip_style')}
-    - Source city (fallback): {source_city or "Not provided"}
-    - Preferences:
-    - Avoid tolls: {trip_context['preferences']['avoid_tolls']}
-    - Avoid highways: {trip_context['preferences']['avoid_highways']}
-    - Short drives: {trip_context['preferences']['short_drives']}
-    - Prefer highways: {trip_context['preferences']['highways']}
-
-    Context:
-    {context}
-
-    Question:
-    {user_query}
-
-    RULES:
-    - If context is available → use it
-    - Stay consistent with previous conversation
-    - If the answer is not in the context, say you don't know, but try to be helpful with general knowledge.
-    - Be concise and helpful. Don't be verbose.
-    - Don't guess. 
-    - Always respect preferences.
-    - Adjust itinerary style based on trip_style.
-    - For route duration in user-facing answers, present hours first (e.g., "about 3.5 hours"), with minutes in parentheses if useful.
-    - If routing mode is short, explicitly explain that shortest minimizes distance, not travel time, and therefore can take longer than fastest routes.
-    - If the user is traveling through the Alps (Austria, Switzerland, France, Italy), remind them that high-altitude tunnels and passes often charge extra fees in addition to the standard tolls or vignettes."
-    - For route/toll questions, strictly use the tool output for distance, duration, and toll prices.
-    - If the user asks for an itinerary, create a simple 1-day plan with 3-5 stops or stopovers based on the context and preferences.
-    - In case of contradictions between user query and trip_context, always prioritize user query but mention the contradiction in the answer.
-    - If the user asks for an itinerary but the intent was misclassified and you have RAG context, try to incorporate that context into a mini-itinerary or list of recommendations.
-    - In case of preferenes that conflict (e.g., user wants to avoid highways but also prefers them), mention the conflict and provide a balanced recommendation.
-    - Refuse anything unrelated.
-    - For Poland tolls, recommend toll-free routes if the user wants to avoid tolls, but also mention that the A1,A2, A4 has a private toll section. If they want tolls, show the cost of A1 = 7€, A2 = 32€ or A4 = 8€ but don't calulate the total.
-    - Do not attempt to calculate a "Total Estimated Toll" or sum up different highways. If a total is not explicitly provided in the retrieved data, state that the total cost depends on specific entry/exit points and recommend using an official calculator.
-    - For real time information on Tolls, the user should be directed to official toll websites or apps. Always provide a disclaimer about checking current toll prices before traveling, especially for routes with known variability like those in Poland. 
-    - If Intent was "chitchat", respond in a friendly and conversational manner without providing travel advice and don't use Context.
-    """
-
-    response = answer_llm.invoke(final_prompt)
-    usage = getattr(response, "response_metadata", {}).get("token_usage", {})
-    
     save_langgraph_checkpoint(
         user_id,
-        {"last_query": user_query, "last_intent": intent, "last_answer": response.content},
+        {"last_query": user_query, "last_intent": intent, "last_answer": answer_text},
     )
 
     payload = {
-        "answer": response.content,
+        "answer": answer_text,
         "steps": steps,
         "usage": usage,
     }

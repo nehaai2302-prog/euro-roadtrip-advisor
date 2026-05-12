@@ -21,3 +21,6 @@ venv/
 
 # SQLite database file
 app_state.sqlite3
+
+# RAGAS Evaluation results
+eval/results/

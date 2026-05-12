@@ -21,3 +21,8 @@ dependencies = [
     "streamlit-authenticator>=0.4.2",
     "streamlit-folium>=0.27.2",
 ]
+
+[project.optional-dependencies]
+eval = [
+    "ragas>=0.4.3",
+]
