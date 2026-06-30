@@ -23,6 +23,7 @@ from langchain_chroma import Chroma
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langsmith import traceable
 import importlib
+import openai
 
 
 def _load_sqlite_saver():
@@ -176,6 +177,30 @@ def _clean_city_fragment(raw: str) -> str:
     s = s.strip("?.!,;:")
     s = re.sub(r"\s+", " ", s)
     return _normalize_city_name(s)
+
+
+def _format_openai_exception(exc: Exception) -> str | None:
+    message = str(exc) or ""
+    lower = message.lower()
+    if any(keyword in lower for keyword in [
+        "invalid_api_key",
+        "invalid key",
+        "expired",
+        "authentication",
+        "permission denied",
+        "missing",
+        "api key",
+        "openai key",
+    ]):
+        return (
+            "❌ OpenAI API key issue: your key is missing, invalid, or expired. "
+            "Please set a valid `OPENAI_API_KEY` in your `.env` file or Streamlit Secrets."
+        )
+    if "rate limit" in lower or "too many requests" in lower:
+        return "⚠️ OpenAI rate limit reached. Please wait a moment and try again."
+    if "service unavailable" in lower or "timeout" in lower or "connection" in lower:
+        return "⚠️ OpenAI service is unavailable right now. Please try again later."
+    return None
 
 
 def heuristic_route_params(user_query: str) -> dict:
@@ -476,7 +501,13 @@ def invoke_final_answer(
     - If Intent was "chitchat", respond in a friendly and conversational manner without providing travel advice and don't use Context.
     """
 
-    response = answer_llm.invoke(final_prompt)
+    try:
+        response = answer_llm.invoke(final_prompt)
+    except Exception as exc:
+        friendly = _format_openai_exception(exc)
+        if friendly:
+            return friendly, {}
+        raise
     usage = getattr(response, "response_metadata", {}).get("token_usage", {})
     return response.content, usage
 

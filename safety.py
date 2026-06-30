@@ -1,5 +1,5 @@
 import os
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,7 +20,21 @@ def check_safety(user_text):
     # --- Part 2: OpenAI Moderation API ---
     client = OpenAI()
     
-    response = client.moderations.create(input=user_text)
+    try:
+        response = client.moderations.create(input=user_text)
+    except OpenAIError as exc:
+        message = str(exc).lower()
+        if any(keyword in message for keyword in [
+            "invalid_api_key",
+            "invalid key",
+            "expired",
+            "authentication",
+            "missing",
+            "api key",
+            "openai key",
+        ]):
+            return False, "OpenAI API key issue: missing, invalid, or expired. Please verify OPENAI_API_KEY."
+        raise
     output = response.results[0]
 
     # If 'flagged' is True, the content violated OpenAI's safety policies

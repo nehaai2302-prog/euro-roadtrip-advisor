@@ -6,6 +6,7 @@ import json
 import pandas as pd
 from datetime import datetime
 from io import BytesIO
+from openai import OpenAIError
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from streamlit_folium import st_folium
@@ -155,6 +156,30 @@ def _format_tool_output_for_display(tool_name: str, tool_output):
     elif poly:
         summary["polyline_note"] = "Encoded geometry (truncated in UI if very long)."
     return summary
+
+
+def _openai_key_error_message(exc: Exception) -> str | None:
+    message = str(exc) or ""
+    lower = message.lower()
+    if any(keyword in lower for keyword in [
+        "invalid_api_key",
+        "invalid key",
+        "expired",
+        "authentication",
+        "permission denied",
+        "api key",
+        "openai key",
+        "missing",
+    ]):
+        return (
+            "❌ OpenAI API key issue: your key is missing, invalid, or expired. "
+            "Please set a valid `OPENAI_API_KEY` in your `.env` file or Streamlit Secrets."
+        )
+    if "rate limit" in lower or "too many requests" in lower:
+        return "⚠️ OpenAI rate limit reached. Please wait a moment and try again."
+    if "service unavailable" in lower or "timeout" in lower or "connection" in lower:
+        return "⚠️ OpenAI service is unavailable right now. Please try again later."
+    return None
 
 
 def render_account_forms(key_prefix: str = "account"):
@@ -383,7 +408,12 @@ for message in st.session_state.messages:
 if prompt := st.chat_input("Ask about your route, driving laws, or stopovers..."):
     
     # --- STEP A: SAFETY FILTER (The Gatekeeper) ---
-    is_safe, reason = check_safety(prompt)
+    try:
+        is_safe, reason = check_safety(prompt)
+    except Exception as exc:
+        user_error = _openai_key_error_message(exc)
+        st.error(user_error or "❌ Unable to validate your message because of an OpenAI API issue. Please verify your OPENAI_API_KEY.")
+        st.stop()
     
     if not is_safe:
         st.error(f"🚨 **Safety Alert:** Your message was flagged for: **{reason}**. Please keep your questions related to legal and safe travel.")
@@ -408,13 +438,19 @@ if prompt := st.chat_input("Ask about your route, driving laws, or stopovers..."
                 # Execute the Agent-based RAG Pipeline. 
                 # In 1.2.x, result is now a dictionary containing 'messages' and 'steps' (the modern equivalent of intermediate_steps).
                 # The agent now decides if it needs weather, fuel, or the knowledge base
-                result = get_response(
-                    prompt,
-                    chat_history=chat_history,
-                    traveler_type=traveler_type,
-                    trip_context=trip_context,
-                    user_id=st.session_state.auth_user,
-                )
+                try:
+                    result = get_response(
+                        prompt,
+                        chat_history=chat_history,
+                        traveler_type=traveler_type,
+                        trip_context=trip_context,
+                        user_id=st.session_state.auth_user,
+                    )
+                except Exception as exc:
+                    user_error = _openai_key_error_message(exc)
+                    st.error(user_error or "❌ Unable to generate a response because of an OpenAI API issue. Please verify your OPENAI_API_KEY.")
+                    st.stop()
+
                 st.session_state.result = result
                 
                 status.update(label="✅ Decision Made & Advice Generated", state="complete")
